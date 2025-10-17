@@ -136,6 +136,11 @@ const (
 	TeiTruncateParamName string = "truncate"
 )
 
+// contextual ai
+const (
+	ContextualAIAKEnvStr string = "MILVUS_CONTEXTUAL_AI_API_KEY"
+)
+
 func ParseAKAndURL(credentials *credentials.Credentials, params []*commonpb.KeyValuePair, confParams map[string]string, apiKeyEnv string) (string, string, error) {
 	// function param > yaml > env
 	var err error
