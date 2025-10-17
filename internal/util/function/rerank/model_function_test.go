@@ -268,6 +268,38 @@ func (s *RerankModelSuite) TestNewProvider() {
 		_, err := newProvider(params)
 		s.NoError(err)
 	}
+	{
+		params := []*commonpb.KeyValuePair{
+			{Key: providerParamName, Value: "contextualai"},
+			{Key: models.CredentialParamKey, Value: "mock"},
+		}
+		_, err := newProvider(params)
+		s.ErrorContains(err, "contextual ai rerank model name is required")
+	}
+	{
+		params := []*commonpb.KeyValuePair{
+			{Key: providerParamName, Value: "contextualai"},
+			{Key: models.ModelNameParamKey, Value: "ctxl-rerank-v2-instruct-multilingual"},
+			{Key: models.CredentialParamKey, Value: "mock"},
+			{Key: models.MaxClientBatchSizeParamKey, Value: "10"},
+		}
+		_, err := newProvider(params)
+		s.NoError(err)
+	}
+	{
+		params := []*commonpb.KeyValuePair{
+			{Key: providerParamName, Value: "contextualai"},
+			{Key: models.ModelNameParamKey, Value: "ctxl-rerank-v2-instruct-multilingual"},
+			{Key: models.CredentialParamKey, Value: "mock"},
+		}
+		paramtable.Get().FunctionCfg.RerankModelProviders.GetFunc = func() map[string]string {
+			key := "contextualai.enable"
+			return map[string]string{key: "false"}
+		}
+		_, err := newProvider(params)
+		s.ErrorContains(err, "Rerank provider: [contextualai] is disabled")
+		paramtable.Get().FunctionCfg.RerankModelProviders.GetFunc = func() map[string]string { return map[string]string{} }
+	}
 }
 
 func (s *RerankModelSuite) TestCallVllm() {
@@ -419,6 +451,42 @@ func (s *RerankModelSuite) TestCallVoyageAI() {
 		scores, err := provder.rerank(context.Background(), "mytest", []string{"t1", "t2", "t3"})
 		s.NoError(err)
 		s.Equal([]float32{0.0, 0.1, 0.2}, scores)
+	}
+}
+
+func (s *RerankModelSuite) TestCallContextualAI() {
+	{
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"results": [{"index": 0, "relevance_score": 0.0}, {"index": 2, "relevance_score": 0.2}, {"index": 1, "relevance_score": 0.1}]}`))
+		}))
+		defer ts.Close()
+		params := []*commonpb.KeyValuePair{
+			{Key: providerParamName, Value: "contextualai"},
+			{Key: models.ModelNameParamKey, Value: "ctxl-rerank-v2-instruct-multilingual"},
+			{Key: models.CredentialParamKey, Value: "mock"},
+		}
+		provder, err := newContextualAIProvider(params, map[string]string{models.URLParamKey: ts.URL}, credentials.NewCredentials(map[string]string{"mock.apikey": "mock"}))
+		s.NoError(err)
+		scores, err := provder.rerank(context.Background(), "mytest", []string{"t1", "t2", "t3"})
+		s.NoError(err)
+		s.Equal([]float32{0.0, 0.1, 0.2}, scores)
+	}
+	{
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`not json`))
+		}))
+		defer ts.Close()
+		params := []*commonpb.KeyValuePair{
+			{Key: providerParamName, Value: "contextualai"},
+			{Key: models.ModelNameParamKey, Value: "ctxl-rerank-v2-instruct-multilingual"},
+			{Key: models.CredentialParamKey, Value: "mock"},
+		}
+		provder, err := newContextualAIProvider(params, map[string]string{models.URLParamKey: ts.URL}, credentials.NewCredentials(map[string]string{"mock.apikey": "mock"}))
+		s.NoError(err)
+		_, err = provder.rerank(context.Background(), "mytest", []string{"t1", "t2", "t3"})
+		s.ErrorContains(err, "Call service failed")
 	}
 }
 
@@ -677,6 +745,53 @@ func (s *RerankModelSuite) TestRerankProcess() {
 		ret, err := f.Process(context.Background(), NewSearchParams(nq, 3, 2, 1, -1, 1, false, "", []string{"COSINE", "COSINE", "COSINE"}), inputs)
 		s.NoError(err)
 		s.Equal([]int64{3, 3, 3}, ret.searchResultData.Topks)
+		s.Equal(int64(3), ret.searchResultData.TopK)
+	}
+
+	// Contextual AI end-to-end via ModelFunction
+	{
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			req := map[string]any{}
+			body, _ := io.ReadAll(r.Body)
+			defer r.Body.Close()
+			json.Unmarshal(body, &req)
+			ret := map[string][]map[string]any{}
+			ret["results"] = []map[string]any{}
+			for i := range req["documents"].([]any) {
+				d := map[string]any{}
+				d["index"] = i
+				d["relevance_score"] = float32(i) / 10
+				ret["results"] = append(ret["results"], d)
+			}
+			jsonData, _ := json.Marshal(ret)
+			w.Write(jsonData)
+		}))
+		defer ts.Close()
+
+		paramtable.Get().FunctionCfg.RerankModelProviders.GetFunc = func() map[string]string {
+			return map[string]string{models.URLParamKey: ts.URL}
+		}
+
+		functionSchema := &schemapb.FunctionSchema{
+			Name:            "test",
+			Type:            schemapb.FunctionType_Rerank,
+			InputFieldNames: []string{"text"},
+			Params: []*commonpb.KeyValuePair{
+				{Key: providerParamName, Value: "contextualai"},
+				{Key: models.ModelNameParamKey, Value: "ctxl-rerank-v2-instruct-multilingual"},
+				{Key: models.CredentialParamKey, Value: "mock"},
+				{Key: queryKeyName, Value: `['q1']`},
+			},
+		}
+		nq := int64(1)
+		f, err := newModelFunction(schema, functionSchema)
+		s.NoError(err)
+		data := embedding.GenSearchResultData(nq, 3, schemapb.DataType_VarChar, "text", 101)
+		inputs, _ := newRerankInputs([]*schemapb.SearchResultData{data}, f.GetInputFieldIDs(), false)
+		ret, err := f.Process(context.Background(), NewSearchParams(nq, 3, 0, -1, -1, 1, false, "", []string{"COSINE"}), inputs)
+		s.NoError(err)
+		s.Equal([]int64{3}, ret.searchResultData.Topks)
 		s.Equal(int64(3), ret.searchResultData.TopK)
 	}
 }
